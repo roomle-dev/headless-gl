@@ -94,8 +94,14 @@ function createContext (width, height, options) {
 
   // Initialize texture units
   const numTextures = ctx.getParameter(ctx.MAX_COMBINED_TEXTURE_IMAGE_UNITS)
-  ctx._textureUnits = new Array(numTextures)
-  for (let i = 0; i < numTextures; ++i) {
+  if (process.env.HEADLESS_GL_DEBUG === '1') {
+    console.error('[headless-gl] MAX_COMBINED_TEXTURE_IMAGE_UNITS =', numTextures,
+      'GL_VENDOR =', ctx.getParameter(0x1F00),
+      'GL_RENDERER =', ctx.getParameter(0x1F01),
+      'GL_VERSION =', ctx.getParameter(0x1F02))
+  }
+  ctx._textureUnits = new Array(numTextures || 0)
+  for (let i = 0; i < (numTextures || 0); ++i) {
     ctx._textureUnits[i] = new WebGLTextureUnit(ctx, i)
   }
   ctx._activeTextureUnit = 0

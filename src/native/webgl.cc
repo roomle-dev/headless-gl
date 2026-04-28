@@ -1,5 +1,8 @@
 #include <array>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -120,6 +123,10 @@ GLenum OverrideDrawBufferEnum(GLenum buffer) {
 
 std::set<std::string> GetStringSetFromCString(const char *cstr) {
   std::set<std::string> result;
+  // glGetString can return nullptr (e.g. GL_REQUESTABLE_EXTENSIONS_ANGLE on
+  // a non-ANGLE driver like NVIDIA's GLES). std::istringstream(nullptr)
+  // throws basic_string: construction from null is not valid, so guard it.
+  if (!cstr) return result;
   std::istringstream iss(cstr); // Create an input string stream
   std::string word;
 
@@ -144,9 +151,48 @@ std::string JoinStringSet(const std::set<std::string> &inputSet,
 }
 
 bool WebGLRenderingContext::HAS_DISPLAY = false;
+bool WebGLRenderingContext::USE_DEVICE_PATH = false;
+bool WebGLRenderingContext::TRACE_CALLS = false;
 EGLDisplay WebGLRenderingContext::DISPLAY;
 WebGLRenderingContext *WebGLRenderingContext::ACTIVE = NULL;
 WebGLRenderingContext *WebGLRenderingContext::CONTEXT_LIST_HEAD = NULL;
+
+// glGet*RobustANGLE are ANGLE extensions. NVIDIA's GLES driver may either
+// return null for these (eglGetProcAddress hits an unknown function) or
+// return a non-null inert stub (depending on driver). Our null check on the
+// pointer alone is therefore unreliable — NVIDIA's stub returns without
+// touching bytesWritten so we get back null/zero for everything.
+//
+// Branch on USE_DEVICE_PATH instead, which is set once when we successfully
+// initialize the device-EGL display: if true we always use the standard
+// non-Robust calls.
+static inline void GetBooleanvCompat(GLenum name, GLsizei bufSize,
+                                     GLsizei *bytesWritten, GLboolean *params) {
+  if (!WebGLRenderingContext::USE_DEVICE_PATH && glGetBooleanvRobustANGLE) {
+    glGetBooleanvRobustANGLE(name, bufSize, bytesWritten, params);
+  } else {
+    glGetBooleanv(name, params);
+    *bytesWritten = bufSize;
+  }
+}
+static inline void GetIntegervCompat(GLenum name, GLsizei bufSize,
+                                     GLsizei *bytesWritten, GLint *params) {
+  if (!WebGLRenderingContext::USE_DEVICE_PATH && glGetIntegervRobustANGLE) {
+    glGetIntegervRobustANGLE(name, bufSize, bytesWritten, params);
+  } else {
+    glGetIntegerv(name, params);
+    *bytesWritten = bufSize;
+  }
+}
+static inline void GetFloatvCompat(GLenum name, GLsizei bufSize,
+                                   GLsizei *bytesWritten, GLfloat *params) {
+  if (!WebGLRenderingContext::USE_DEVICE_PATH && glGetFloatvRobustANGLE) {
+    glGetFloatvRobustANGLE(name, bufSize, bytesWritten, params);
+  } else {
+    glGetFloatv(name, params);
+    *bytesWritten = bufSize;
+  }
+}
 
 #define GL_METHOD(method_name) \
   Napi::Value WebGLRenderingContext::method_name(const Napi::CallbackInfo& info)
@@ -157,6 +203,9 @@ WebGLRenderingContext *WebGLRenderingContext::CONTEXT_LIST_HEAD = NULL;
   if (!(inst && inst->setActive())) {                                                              \
     Napi::Error::New(env, "Invalid GL context").ThrowAsJavaScriptException();                      \
     return env.Undefined();                                                                        \
+  }                                                                                               \
+  if (WebGLRenderingContext::TRACE_CALLS) {                                                        \
+    std::cerr << "[gl-trace] " << __func__ << "\n" << std::flush;                                  \
   }
 
 bool ContextSupportsExtensions(WebGLRenderingContext *inst,
@@ -184,7 +233,8 @@ WebGLRenderingContext::WebGLRenderingContext(const Napi::CallbackInfo& info)
     : Napi::ObjectWrap<WebGLRenderingContext>(info),
       state(GLCONTEXT_STATE_INIT), unpack_flip_y(false), unpack_premultiply_alpha(false),
       unpack_colorspace_conversion(0x9244), unpack_alignment(4),
-      webGLToANGLEExtensions(&CaseInsensitiveCompare), next(NULL), prev(NULL) {
+      webGLToANGLEExtensions(&CaseInsensitiveCompare), next(NULL), prev(NULL),
+      lastGLCallTime(std::chrono::steady_clock::now()) {
   Napi::Env env = info.Env();
   if (info.Length() < 11) {
     // Called with no args (e.g. from wrapContext) — create an empty shell, no GL context.
@@ -221,6 +271,20 @@ void WebGLRenderingContext::_initContext(int width, int height, bool alpha, bool
                                          bool preferLowPowerToHighPerformance,
                                          bool failIfMajorPerformanceCaveat,
                                          bool createWebGL2Context) {
+  // Whether to take the device-EGL path (NVIDIA on Cloud Run / GBM) rather
+  // than the legacy default-display path (ANGLE software, Mac, Windows).
+  // Read once at the top of the function; consulted in display selection
+  // and again when picking eglCreateContext attribs (NVIDIA rejects the
+  // ANGLE-specific WEBGL_COMPATIBILITY / ROBUST_RESOURCE_INITIALIZATION
+  // attributes — we only pass them on the legacy ANGLE path).
+  const char *headlessUseDeviceEnv = std::getenv("HEADLESS_GL_USE_DEVICE");
+  const bool useDeviceEgl =
+      headlessUseDeviceEnv != nullptr && headlessUseDeviceEnv[0] == '1';
+
+  // Enable GL call tracing if requested (identifies crash point on device path)
+  const char *traceEnv = std::getenv("HEADLESS_GL_TRACE");
+  if (traceEnv && traceEnv[0] == '1') TRACE_CALLS = true;
+
   if (!eglGetProcAddress) {
     if (!eglLibrary.open("libEGL")) {
       errorMessage = "Error opening ANGLE shared library.";
@@ -234,9 +298,63 @@ void WebGLRenderingContext::_initContext(int width, int height, bool alpha, bool
 
   // Get display
   if (!HAS_DISPLAY) {
-    DISPLAY = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    DISPLAY = EGL_NO_DISPLAY;
+
+    // Optional GPU device path. When HEADLESS_GL_USE_DEVICE=1 is set, use
+    // EGL_EXT_platform_device + eglQueryDevicesEXT to bind directly to a
+    // hardware GPU (e.g. NVIDIA L4 on Cloud Run) instead of the default
+    // eglGetDisplay(EGL_DEFAULT_DISPLAY) path. NVIDIA's libEGL refuses
+    // EGL_DEFAULT_DISPLAY headlessly — it requires explicit device
+    // enumeration. Without this branch the only working path is ANGLE's
+    // bundled software EGL, which means CPU rendering even when a GPU is
+    // attached to the container.
+    if (useDeviceEgl) {
+      // eglQueryDevicesEXT is not in the autoloaded EGL surface — load it
+      // dynamically. eglGetPlatformDisplayEXT IS already loaded by LoadEGL().
+      typedef EGLBoolean (EGLAPIENTRYP PFNQUERYDEVICES)(
+          EGLint max_devices, EGLDeviceEXT *devices, EGLint *num_devices);
+      auto queryDevices = reinterpret_cast<PFNQUERYDEVICES>(
+          eglGetProcAddress("eglQueryDevicesEXT"));
+
+      if (!queryDevices) {
+        std::cerr << "[headless-gl] HEADLESS_GL_USE_DEVICE=1 but "
+                     "eglQueryDevicesEXT not exported by the loaded libEGL"
+                  << std::endl;
+      } else if (!eglGetPlatformDisplayEXT) {
+        std::cerr << "[headless-gl] HEADLESS_GL_USE_DEVICE=1 but "
+                     "eglGetPlatformDisplayEXT not exported by the loaded libEGL"
+                  << std::endl;
+      } else {
+        EGLDeviceEXT devices[8];
+        EGLint numDevices = 0;
+        if (queryDevices(8, devices, &numDevices) && numDevices > 0) {
+          DISPLAY = eglGetPlatformDisplayEXT(EGL_PLATFORM_DEVICE_EXT,
+                                             devices[0], nullptr);
+          if (DISPLAY != EGL_NO_DISPLAY) {
+            USE_DEVICE_PATH = true;
+            std::cerr << "[headless-gl] using EGL_PLATFORM_DEVICE_EXT ("
+                      << numDevices << " device(s) enumerated, picked #0)"
+                      << std::endl;
+          } else {
+            std::cerr << "[headless-gl] eglGetPlatformDisplayEXT returned "
+                         "EGL_NO_DISPLAY for device #0"
+                      << std::endl;
+          }
+        } else {
+          std::cerr << "[headless-gl] eglQueryDevicesEXT found "
+                    << numDevices << " device(s) — falling back" << std::endl;
+        }
+      }
+    }
+
+    // Fallback: legacy default-display path. This is the only path on
+    // ANGLE's bundled software EGL and on systems without the device
+    // extension; it is also the cheap path on Mac (Metal) and Windows.
     if (DISPLAY == EGL_NO_DISPLAY) {
-      errorMessage = "Error retrieving EGL default display.";
+      DISPLAY = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    }
+    if (DISPLAY == EGL_NO_DISPLAY) {
+      errorMessage = "Error retrieving EGL display.";
       state = GLCONTEXT_STATE_ERROR;
       return;
     }
@@ -248,12 +366,27 @@ void WebGLRenderingContext::_initContext(int width, int height, bool alpha, bool
       return;
     }
 
+    // Bind the OpenGL ES client API. Default-bound is EGL_OPENGL_ES_API on
+    // most drivers but NVIDIA's libEGL is stricter when its current bind
+    // state isn't ES — be explicit so eglCreateContext picks the right path.
+    if (useDeviceEgl) {
+      eglBindAPI(EGL_OPENGL_ES_API);
+    }
+
     // Save display
     HAS_DISPLAY = true;
   }
 
-  // Set up configuration
-  EGLint renderableTypeBit = createWebGL2Context ? EGL_OPENGL_ES2_BIT : EGL_OPENGL_ES3_BIT;
+  // Set up configuration. Note: the ANGLE path uses what looks like an
+  // inverted ES2/ES3 bit — keep that as-is for backwards compat, but on the
+  // device-EGL path use the correct mapping (WebGL2 → GLES3) so NVIDIA
+  // returns a matching config.
+  EGLint renderableTypeBit;
+  if (useDeviceEgl) {
+    renderableTypeBit = createWebGL2Context ? EGL_OPENGL_ES3_BIT : EGL_OPENGL_ES2_BIT;
+  } else {
+    renderableTypeBit = createWebGL2Context ? EGL_OPENGL_ES2_BIT : EGL_OPENGL_ES3_BIT;
+  }
   EGLint attrib_list[] = {EGL_SURFACE_TYPE,
                           EGL_PBUFFER_BIT,
                           EGL_RED_SIZE,
@@ -278,17 +411,26 @@ void WebGLRenderingContext::_initContext(int width, int height, bool alpha, bool
     return;
   }
 
-  // Create context
-  EGLint contextAttribs[] = {EGL_CONTEXT_CLIENT_VERSION,
-                             createWebGL2Context ? 3 : 2,
-                             EGL_CONTEXT_WEBGL_COMPATIBILITY_ANGLE,
-                             EGL_TRUE,
-                             EGL_CONTEXT_OPENGL_BACKWARDS_COMPATIBLE_ANGLE,
-                             EGL_FALSE,
-                             EGL_ROBUST_RESOURCE_INITIALIZATION_ANGLE,
-                             EGL_TRUE,
-                             EGL_NONE};
-  context = eglCreateContext(DISPLAY, config, EGL_NO_CONTEXT, contextAttribs);
+  // Create context. The EGL_CONTEXT_*_ANGLE attributes are ANGLE-specific
+  // extensions; NVIDIA's libEGL rejects them with EGL_BAD_ATTRIBUTE and
+  // returns EGL_NO_CONTEXT. On the device-EGL path we use only standard
+  // attribs — WebGL spec compliance (clamping/error reporting) is then
+  // best-effort rather than enforced by the driver, which is fine for our
+  // server-side rendering use case.
+  EGLint contextAttribsAngle[] = {EGL_CONTEXT_CLIENT_VERSION,
+                                  createWebGL2Context ? 3 : 2,
+                                  EGL_CONTEXT_WEBGL_COMPATIBILITY_ANGLE,
+                                  EGL_TRUE,
+                                  EGL_CONTEXT_OPENGL_BACKWARDS_COMPATIBLE_ANGLE,
+                                  EGL_FALSE,
+                                  EGL_ROBUST_RESOURCE_INITIALIZATION_ANGLE,
+                                  EGL_TRUE,
+                                  EGL_NONE};
+  EGLint contextAttribsStd[] = {EGL_CONTEXT_CLIENT_VERSION,
+                                createWebGL2Context ? 3 : 2,
+                                EGL_NONE};
+  context = eglCreateContext(DISPLAY, config, EGL_NO_CONTEXT,
+                             useDeviceEgl ? contextAttribsStd : contextAttribsAngle);
   if (context == EGL_NO_CONTEXT) {
     state = GLCONTEXT_STATE_ERROR;
     return;
@@ -316,6 +458,191 @@ void WebGLRenderingContext::_initContext(int width, int height, bool alpha, bool
 
   LoadGLES(eglGetProcAddress);
 
+  // Phase 3 device-path fixup ─────────────────────────────────────────────────
+  // On the NVIDIA EGL device path, eglGetProcAddress may return NULL for some
+  // GLES3 core functions (the EGL spec says it's optional for non-extensions).
+  // We fall back to dlsym(RTLD_DEFAULT) to pick them up from the already-loaded
+  // libGLESv2.so. Any pointer that is still NULL after that pass is logged
+  // (when HEADLESS_GL_DEBUG=1) so we can see exactly what the driver is missing.
+  //
+  // We also remap ANGLE-specific extension function pointers to their standard
+  // GLES3 equivalents. This is belt-and-suspenders: all call sites in webgl.cc
+  // already guard via !USE_DEVICE_PATH, but remapping ensures that any call site
+  // we might have missed also uses a real function instead of a null/inert stub.
+  if (USE_DEVICE_PATH) {
+    const char *dbg = std::getenv("HEADLESS_GL_DEBUG");
+    const bool debugMode = dbg && dbg[0] == '1';
+
+    // ── dlsym fallback for GLES3 core functions ─────────────────────────────
+    // Load from the currently-mapped libGLESv2 (NVIDIA's, after the CMD
+    // symlink step). RTLD_DEFAULT searches all loaded shared libraries.
+#define FILL_GLES3(ptr, name)                                                   \
+    if (!l_gl##ptr) {                                                            \
+      l_gl##ptr = reinterpret_cast<decltype(l_gl##ptr)>(dlsym(RTLD_DEFAULT, "gl" #name)); \
+      if (debugMode) {                                                            \
+        if (l_gl##ptr)                                                           \
+          std::cerr << "[headless-gl] dlsym recovered: gl" #name "\n";          \
+        else                                                                     \
+          std::cerr << "[headless-gl] NULL after dlsym: gl" #name "\n";         \
+      }                                                                          \
+    }
+
+    // Core GLES2 functions that eglGetProcAddress sometimes skips
+    FILL_GLES3(DrawArrays,           DrawArrays)
+    FILL_GLES3(DrawElements,         DrawElements)
+    FILL_GLES3(Clear,                Clear)
+    FILL_GLES3(ClearColor,           ClearColor)
+    FILL_GLES3(Viewport,             Viewport)
+    FILL_GLES3(UseProgram,           UseProgram)
+    FILL_GLES3(BindTexture,          BindTexture)
+    FILL_GLES3(TexImage2D,           TexImage2D)
+    FILL_GLES3(TexSubImage2D,        TexSubImage2D)
+    FILL_GLES3(TexParameteri,        TexParameteri)
+    FILL_GLES3(GenerateMipmap,       GenerateMipmap)
+    FILL_GLES3(GetIntegerv,          GetIntegerv)
+    FILL_GLES3(GetFloatv,            GetFloatv)
+    FILL_GLES3(GetBooleanv,          GetBooleanv)
+
+    // GLES3 core functions most likely to be missing via eglGetProcAddress
+    FILL_GLES3(DrawBuffers,                      DrawBuffers)
+    FILL_GLES3(BlitFramebuffer,                  BlitFramebuffer)
+    FILL_GLES3(RenderbufferStorageMultisample,    RenderbufferStorageMultisample)
+    FILL_GLES3(BindVertexArray,                  BindVertexArray)
+    FILL_GLES3(GenVertexArrays,                  GenVertexArrays)
+    FILL_GLES3(DeleteVertexArrays,               DeleteVertexArrays)
+    FILL_GLES3(IsVertexArray,                    IsVertexArray)
+    FILL_GLES3(DrawArraysInstanced,              DrawArraysInstanced)
+    FILL_GLES3(DrawElementsInstanced,            DrawElementsInstanced)
+    FILL_GLES3(VertexAttribDivisor,              VertexAttribDivisor)
+    FILL_GLES3(VertexAttribIPointer,             VertexAttribIPointer)
+    FILL_GLES3(TexStorage2D,                     TexStorage2D)
+    FILL_GLES3(TexStorage3D,                     TexStorage3D)
+    FILL_GLES3(TexImage3D,                       TexImage3D)
+    FILL_GLES3(TexSubImage3D,                    TexSubImage3D)
+    FILL_GLES3(ClearBufferfv,                    ClearBufferfv)
+    FILL_GLES3(ClearBufferiv,                    ClearBufferiv)
+    FILL_GLES3(ClearBufferuiv,                   ClearBufferuiv)
+    FILL_GLES3(ClearBufferfi,                    ClearBufferfi)
+    FILL_GLES3(InvalidateFramebuffer,            InvalidateFramebuffer)
+    FILL_GLES3(InvalidateSubFramebuffer,         InvalidateSubFramebuffer)
+    FILL_GLES3(FramebufferTextureLayer,          FramebufferTextureLayer)
+    FILL_GLES3(ReadBuffer,                       ReadBuffer)
+    FILL_GLES3(GetInternalformativ,              GetInternalformativ)
+    FILL_GLES3(GetIntegeri_v,                    GetIntegeri_v)
+    FILL_GLES3(GetInteger64v,                    GetInteger64v)
+    FILL_GLES3(GetInteger64i_v,                  GetInteger64i_v)
+    FILL_GLES3(UniformBlockBinding,              UniformBlockBinding)
+    FILL_GLES3(BindBufferBase,                   BindBufferBase)
+    FILL_GLES3(BindBufferRange,                  BindBufferRange)
+    FILL_GLES3(CopyBufferSubData,                CopyBufferSubData)
+    FILL_GLES3(BeginTransformFeedback,           BeginTransformFeedback)
+    FILL_GLES3(EndTransformFeedback,             EndTransformFeedback)
+    FILL_GLES3(PauseTransformFeedback,           PauseTransformFeedback)
+    FILL_GLES3(ResumeTransformFeedback,          ResumeTransformFeedback)
+    FILL_GLES3(TransformFeedbackVaryings,        TransformFeedbackVaryings)
+    FILL_GLES3(GetTransformFeedbackVarying,      GetTransformFeedbackVarying)
+    FILL_GLES3(FenceSync,                        FenceSync)
+    FILL_GLES3(IsSync,                           IsSync)
+    FILL_GLES3(DeleteSync,                       DeleteSync)
+    FILL_GLES3(ClientWaitSync,                   ClientWaitSync)
+    FILL_GLES3(WaitSync,                         WaitSync)
+    FILL_GLES3(GetSynciv,                        GetSynciv)
+    FILL_GLES3(GenSamplers,                      GenSamplers)
+    FILL_GLES3(DeleteSamplers,                   DeleteSamplers)
+    FILL_GLES3(IsSampler,                        IsSampler)
+    FILL_GLES3(BindSampler,                      BindSampler)
+    FILL_GLES3(SamplerParameteri,                SamplerParameteri)
+    FILL_GLES3(SamplerParameterf,                SamplerParameterf)
+    FILL_GLES3(GetSamplerParameteriv,            GetSamplerParameteriv)
+    FILL_GLES3(GetSamplerParameterfv,            GetSamplerParameterfv)
+    FILL_GLES3(GenTransformFeedbacks,            GenTransformFeedbacks)
+    FILL_GLES3(DeleteTransformFeedbacks,         DeleteTransformFeedbacks)
+    FILL_GLES3(IsTransformFeedback,              IsTransformFeedback)
+    FILL_GLES3(BindTransformFeedback,            BindTransformFeedback)
+    FILL_GLES3(GetFragDataLocation,              GetFragDataLocation)
+    FILL_GLES3(GetProgramBinary,                 GetProgramBinary)
+    FILL_GLES3(ProgramBinary,                    ProgramBinary)
+    FILL_GLES3(ProgramParameteri,                ProgramParameteri)
+    FILL_GLES3(GetActiveUniformBlockiv,          GetActiveUniformBlockiv)
+    FILL_GLES3(GetActiveUniformBlockName,        GetActiveUniformBlockName)
+    FILL_GLES3(GetUniformIndices,                GetUniformIndices)
+    FILL_GLES3(GetActiveUniformsiv,              GetActiveUniformsiv)
+    FILL_GLES3(GetUniformuiv,                    GetUniformuiv)
+    FILL_GLES3(Uniform1ui,                       Uniform1ui)
+    FILL_GLES3(Uniform2ui,                       Uniform2ui)
+    FILL_GLES3(Uniform3ui,                       Uniform3ui)
+    FILL_GLES3(Uniform4ui,                       Uniform4ui)
+    FILL_GLES3(Uniform1uiv,                      Uniform1uiv)
+    FILL_GLES3(Uniform2uiv,                      Uniform2uiv)
+    FILL_GLES3(Uniform3uiv,                      Uniform3uiv)
+    FILL_GLES3(Uniform4uiv,                      Uniform4uiv)
+    FILL_GLES3(UniformMatrix2x3fv,               UniformMatrix2x3fv)
+    FILL_GLES3(UniformMatrix3x2fv,               UniformMatrix3x2fv)
+    FILL_GLES3(UniformMatrix2x4fv,               UniformMatrix2x4fv)
+    FILL_GLES3(UniformMatrix4x2fv,               UniformMatrix4x2fv)
+    FILL_GLES3(UniformMatrix3x4fv,               UniformMatrix3x4fv)
+    FILL_GLES3(UniformMatrix4x3fv,               UniformMatrix4x3fv)
+    FILL_GLES3(VertexAttribI4i,                  VertexAttribI4i)
+    FILL_GLES3(VertexAttribI4ui,                 VertexAttribI4ui)
+    FILL_GLES3(VertexAttribI4iv,                 VertexAttribI4iv)
+    FILL_GLES3(VertexAttribI4uiv,                VertexAttribI4uiv)
+    FILL_GLES3(GetVertexAttribIiv,               GetVertexAttribIiv)
+    FILL_GLES3(GetVertexAttribIuiv,              GetVertexAttribIuiv)
+    FILL_GLES3(DrawRangeElements,                DrawRangeElements)
+    FILL_GLES3(CompressedTexImage3D,             CompressedTexImage3D)
+    FILL_GLES3(CompressedTexSubImage3D,          CompressedTexSubImage3D)
+    FILL_GLES3(CopyTexSubImage3D,                CopyTexSubImage3D)
+    FILL_GLES3(BeginQuery,                       BeginQuery)
+    FILL_GLES3(EndQuery,                         EndQuery)
+    FILL_GLES3(GenQueries,                       GenQueries)
+    FILL_GLES3(DeleteQueries,                    DeleteQueries)
+    FILL_GLES3(IsQuery,                          IsQuery)
+    FILL_GLES3(GetQueryiv,                       GetQueryiv)
+    FILL_GLES3(GetQueryObjectuiv,                GetQueryObjectuiv)
+    FILL_GLES3(MapBufferRange,                   MapBufferRange)
+    FILL_GLES3(FlushMappedBufferRange,           FlushMappedBufferRange)
+    FILL_GLES3(UnmapBuffer,                      UnmapBuffer)
+    FILL_GLES3(GetBufferPointerv,                GetBufferPointerv)
+    FILL_GLES3(GetBufferParameteri64v,           GetBufferParameteri64v)
+    FILL_GLES3(GetStringi,                       GetStringi)
+
+#undef FILL_GLES3
+
+    // ── Remap ANGLE-specific pointers → GLES3 equivalents ───────────────────
+    // After the dlsym pass, the ANGLE-suffixed pointers are still null because
+    // NVIDIA's libGLESv2 doesn't export them. Remap them to the standard GLES3
+    // functions so that any call site that reaches them (via an un-guarded path)
+    // calls a real function rather than crashing through a null pointer.
+    //
+    // The void(*)() intermediate cast is the POSIX-approved way to convert
+    // between function pointer types without going through void* (which is
+    // technically UB in standard C++ but universally accepted in practice).
+    // Using decltype avoids repeating the target type explicitly.
+#define REMAP_TO_GLES3(angle_ptr, gles3_ptr)                                     \
+    if (l_gl##gles3_ptr) {                                                        \
+      l_gl##angle_ptr = reinterpret_cast<decltype(l_gl##angle_ptr)>(             \
+          reinterpret_cast<void(*)()>(l_gl##gles3_ptr));                          \
+    }
+
+    REMAP_TO_GLES3(DrawArraysInstancedANGLE,              DrawArraysInstanced)
+    REMAP_TO_GLES3(DrawElementsInstancedANGLE,            DrawElementsInstanced)
+    REMAP_TO_GLES3(VertexAttribDivisorANGLE,              VertexAttribDivisor)
+    REMAP_TO_GLES3(BlitFramebufferANGLE,                  BlitFramebuffer)
+    REMAP_TO_GLES3(RenderbufferStorageMultisampleANGLE,   RenderbufferStorageMultisample)
+    REMAP_TO_GLES3(DrawBuffersEXT,                        DrawBuffers)
+    REMAP_TO_GLES3(TexStorage2DEXT,                       TexStorage2D)
+    REMAP_TO_GLES3(BindVertexArrayOES,                    BindVertexArray)
+    REMAP_TO_GLES3(GenVertexArraysOES,                    GenVertexArrays)
+    REMAP_TO_GLES3(DeleteVertexArraysOES,                 DeleteVertexArrays)
+    REMAP_TO_GLES3(IsVertexArrayOES,                      IsVertexArray)
+
+#undef REMAP_TO_GLES3
+
+    if (debugMode) {
+      std::cerr << "[headless-gl] Phase-3 fixup complete (device path)\n";
+    }
+  } // end USE_DEVICE_PATH fixup
+
   // Enable the debug callback to debug GL errors.
   // EnableDebugCallback(nullptr);
 
@@ -329,18 +656,25 @@ void WebGLRenderingContext::_initContext(int width, int height, bool alpha, bool
   const char *extensionsString = (const char *)(glGetString(GL_EXTENSIONS));
   enabledExtensions = GetStringSetFromCString(extensionsString);
 
-  const char *requestableExtensionsString =
-      (const char *)glGetString(GL_REQUESTABLE_EXTENSIONS_ANGLE);
-  requestableExtensions = GetStringSetFromCString(requestableExtensionsString);
+  // GL_REQUESTABLE_EXTENSIONS_ANGLE / glRequestExtensionANGLE are ANGLE-only
+  // extensions. NVIDIA's GLES driver returns nullptr / no-op for them — skip
+  // the request flow entirely on the device-EGL path. Without the guard,
+  // glGetString returns null and GetStringSetFromCString below would have
+  // thrown (we also added a null-safe fallback there).
+  if (!useDeviceEgl) {
+    const char *requestableExtensionsString =
+        (const char *)glGetString(GL_REQUESTABLE_EXTENSIONS_ANGLE);
+    requestableExtensions = GetStringSetFromCString(requestableExtensionsString);
+    glRequestExtensionANGLE("GL_EXT_texture_storage");
+  }
 
-  // Request necessary WebGL extensions.
-  glRequestExtensionANGLE("GL_EXT_texture_storage");
-
-  // Select best preferred depth
+  // Select best preferred depth. extensionsString can be null if the driver
+  // misbehaves — use a defensive empty string before strstr.
+  const char *exts = extensionsString ? extensionsString : "";
   preferredDepth = GL_DEPTH_COMPONENT16;
-  if (strstr(extensionsString, "GL_OES_depth32")) {
+  if (strstr(exts, "GL_OES_depth32")) {
     preferredDepth = GL_DEPTH_COMPONENT32_OES;
-  } else if (strstr(extensionsString, "GL_OES_depth24")) {
+  } else if (strstr(exts, "GL_OES_depth24")) {
     preferredDepth = GL_DEPTH_COMPONENT24_OES;
   }
 
@@ -378,14 +712,47 @@ bool WebGLRenderingContext::setActive() {
   if (state != GLCONTEXT_STATE_OK) {
     return false;
   }
-  if (this == ACTIVE) {
+
+  auto now = std::chrono::steady_clock::now();
+
+  // Fast path: context already current and we've seen a GL call recently.
+  //
+  // On NVIDIA's EGL device path (USE_DEVICE_PATH=true) the driver silently
+  // invalidates its internal command-queue / ring-buffer resources after
+  // roughly 100-200 ms of GL inactivity. eglGetCurrentContext() still returns
+  // our context handle (the EGL object is intact), but the very next
+  // GPU-write call (glGenTextures, glBindTexture, …) crashes deep inside the
+  // NVIDIA driver at an arbitrary library address.
+  //
+  // Workaround: whenever it has been >80 ms since the last setActive() on the
+  // device path, force a fresh eglMakeCurrent even if the context appears
+  // current. After re-binding we also call glGetError() — a cheap no-op that
+  // forces the driver to re-initialize its command-queue before the real call.
+  bool idle = false;
+  if (USE_DEVICE_PATH) {
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - lastGLCallTime).count();
+    if (ms > 80) {
+      idle = true;
+      std::cerr << "[headless-gl] setActive: " << ms
+                << "ms idle on NVIDIA device path — forcing re-activation\n";
+    }
+  }
+
+  bool needsMakeCurrent = !(this == ACTIVE && eglGetCurrentContext() == context);
+
+  if (!needsMakeCurrent && !idle) {
+    lastGLCallTime = now;
     return true;
   }
+
   if (!eglMakeCurrent(DISPLAY, surface, surface, context)) {
     state = GLCONTEXT_STATE_ERROR;
     return false;
   }
+
   ACTIVE = this;
+  lastGLCallTime = now;
   return true;
 }
 
@@ -434,7 +801,11 @@ void WebGLRenderingContext::dispose() {
       glDeleteTextures(1, &obj);
       break;
     case GLOBJECT_TYPE_VERTEX_ARRAY:
-      glDeleteVertexArraysOES(1, &obj);
+      if (!WebGLRenderingContext::USE_DEVICE_PATH && glDeleteVertexArraysOES) {
+        glDeleteVertexArraysOES(1, &obj);
+      } else {
+        glDeleteVertexArrays(1, &obj);
+      }
       break;
     default:
       break;
@@ -856,13 +1227,22 @@ GL_METHOD(GetError) {
   return Napi::Number::New(env, inst->getError());
 }
 
+// Instancing — *ANGLE variants are aliases of the core GLES3 functions on
+// ANGLE; NVIDIA has the non-suffixed ones in core GLES3 but the *ANGLE ones
+// resolve to either null or an inert stub. Use the standard versions on the
+// device-EGL path (Three.js for WebGL2 calls these for instanced meshes —
+// without this dispatch the renderer segfaults during the first draw).
 GL_METHOD(VertexAttribDivisorANGLE) {
   GL_BOILERPLATE;
 
   GLuint index = info[0].As<Napi::Number>().Uint32Value();
   GLuint divisor = info[1].As<Napi::Number>().Uint32Value();
 
-  glVertexAttribDivisorANGLE(index, divisor);
+  if (!WebGLRenderingContext::USE_DEVICE_PATH && glVertexAttribDivisorANGLE) {
+    glVertexAttribDivisorANGLE(index, divisor);
+  } else {
+    glVertexAttribDivisor(index, divisor);
+  }
   return env.Undefined();
 }
 
@@ -874,7 +1254,11 @@ GL_METHOD(DrawArraysInstancedANGLE) {
   GLuint count = info[2].As<Napi::Number>().Uint32Value();
   GLuint icount = info[3].As<Napi::Number>().Uint32Value();
 
-  glDrawArraysInstancedANGLE(mode, first, count, icount);
+  if (!WebGLRenderingContext::USE_DEVICE_PATH && glDrawArraysInstancedANGLE) {
+    glDrawArraysInstancedANGLE(mode, first, count, icount);
+  } else {
+    glDrawArraysInstanced(mode, first, count, icount);
+  }
   return env.Undefined();
 }
 
@@ -887,8 +1271,12 @@ GL_METHOD(DrawElementsInstancedANGLE) {
   GLint offset = info[3].As<Napi::Number>().Int32Value();
   GLuint icount = info[4].As<Napi::Number>().Uint32Value();
 
-  glDrawElementsInstancedANGLE(mode, count, type,
-                               reinterpret_cast<GLvoid *>(static_cast<uintptr_t>(offset)), icount);
+  GLvoid *offsetPtr = reinterpret_cast<GLvoid *>(static_cast<uintptr_t>(offset));
+  if (!WebGLRenderingContext::USE_DEVICE_PATH && glDrawElementsInstancedANGLE) {
+    glDrawElementsInstancedANGLE(mode, count, type, offsetPtr, icount);
+  } else {
+    glDrawElementsInstanced(mode, count, type, offsetPtr, icount);
+  }
   return env.Undefined();
 }
 
@@ -1258,18 +1646,48 @@ std::vector<uint8_t> WebGLRenderingContext::unpackPixels(GLenum type, GLenum for
   return unpacked;
 }
 
+// glTex(Sub)Image2DRobustANGLE add a `bufSize` arg ANGLE uses to validate the
+// caller-supplied buffer length. NVIDIA's GLES driver doesn't expose them, so
+// the function pointer is null. Fall back to the standard variants which
+// don't carry that out-of-bounds check — fine for our trusted server-side
+// callers that already pass correctly-sized buffers.
 void CallTexImage2D(GLenum target, GLint level, GLenum internalformat, GLsizei width,
                     GLsizei height, GLint border, GLenum format, GLenum type, GLsizei bufSize,
                     const void *pixels) {
   GLenum sizedInternalFormat = SizeFloatingPointFormat(internalformat);
   if (type == GL_FLOAT && sizedInternalFormat != internalformat) {
-    glTexStorage2DEXT(target, 1, sizedInternalFormat, width, height);
+    // glTexStorage2DEXT is GL_EXT_texture_storage; glTexStorage2D is core
+    // GLES3. NVIDIA exposes core only.
+    if (!WebGLRenderingContext::USE_DEVICE_PATH && glTexStorage2DEXT) {
+      glTexStorage2DEXT(target, 1, sizedInternalFormat, width, height);
+    } else {
+      glTexStorage2D(target, 1, sizedInternalFormat, width, height);
+    }
     if (pixels) {
-      glTexSubImage2DRobustANGLE(target, level, 0, 0, width, height, format, type, bufSize, pixels);
+      if (!WebGLRenderingContext::USE_DEVICE_PATH && glTexSubImage2DRobustANGLE) {
+        glTexSubImage2DRobustANGLE(target, level, 0, 0, width, height, format, type, bufSize, pixels);
+      } else {
+        glTexSubImage2D(target, level, 0, 0, width, height, format, type, pixels);
+      }
     }
   } else {
-    glTexImage2DRobustANGLE(target, level, internalformat, width, height, border, format, type,
-                            bufSize, pixels);
+    if (!WebGLRenderingContext::USE_DEVICE_PATH && glTexImage2DRobustANGLE) {
+      glTexImage2DRobustANGLE(target, level, internalformat, width, height, border, format, type,
+                              bufSize, pixels);
+    } else {
+      glTexImage2D(target, level, internalformat, width, height, border, format, type, pixels);
+    }
+  }
+}
+
+static inline void TexSubImage2DCompat(GLenum target, GLint level, GLint xoffset, GLint yoffset,
+                                       GLsizei width, GLsizei height, GLenum format, GLenum type,
+                                       GLsizei bufSize, const void *pixels) {
+  if (!WebGLRenderingContext::USE_DEVICE_PATH && glTexSubImage2DRobustANGLE) {
+    glTexSubImage2DRobustANGLE(target, level, xoffset, yoffset, width, height, format, type,
+                               bufSize, pixels);
+  } else {
+    glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixels);
   }
 }
 
@@ -1326,11 +1744,11 @@ GL_METHOD(TexSubImage2D) {
 
   if (inst->unpack_flip_y || inst->unpack_premultiply_alpha) {
     std::vector<uint8_t> unpacked = inst->unpackPixels(type, format, width, height, pixels);
-    glTexSubImage2DRobustANGLE(target, level, xoffset, yoffset, width, height, format, type,
-                               unpacked.size(), unpacked.data());
+    TexSubImage2DCompat(target, level, xoffset, yoffset, width, height, format, type,
+                        unpacked.size(), unpacked.data());
   } else {
-    glTexSubImage2DRobustANGLE(target, level, xoffset, yoffset, width, height, format, type,
-                               pixels_len, pixels);
+    TexSubImage2DCompat(target, level, xoffset, yoffset, width, height, format, type,
+                        pixels_len, pixels);
   }
   return env.Undefined();
 }
@@ -2175,7 +2593,7 @@ GL_METHOD(GetParameter) {
   case GL_SCISSOR_TEST:
   case GL_STENCIL_TEST: {
     GLboolean params = GL_FALSE;
-    glGetBooleanvRobustANGLE(name, sizeof(GLboolean), &bytesWritten, &params);
+    GetBooleanvCompat(name, sizeof(GLboolean), &bytesWritten, &params);
 
     return ReturnParamValueOrNull(Napi::Boolean::New(env, params != 0), bytesWritten, env);
   }
@@ -2187,7 +2605,7 @@ GL_METHOD(GetParameter) {
   case GL_SAMPLE_COVERAGE_VALUE:
   case GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT: {
     GLfloat params = 0;
-    glGetFloatvRobustANGLE(name, sizeof(GLfloat), &bytesWritten, &params);
+    GetFloatvCompat(name, sizeof(GLfloat), &bytesWritten, &params);
 
     return ReturnParamValueOrNull(Napi::Number::New(env, params), bytesWritten, env);
   }
@@ -2206,7 +2624,7 @@ GL_METHOD(GetParameter) {
 
   case GL_MAX_VIEWPORT_DIMS: {
     GLint params[2] = {};
-    glGetIntegervRobustANGLE(name, sizeof(GLint) * 2, &bytesWritten, params);
+    GetIntegervCompat(name, sizeof(GLint) * 2, &bytesWritten, params);
 
     Napi::Array arr = Napi::Array::New(env, 2);
     arr.Set((uint32_t)0, Napi::Number::New(env, params[0]));
@@ -2217,7 +2635,7 @@ GL_METHOD(GetParameter) {
   case GL_SCISSOR_BOX:
   case GL_VIEWPORT: {
     GLint params[4] = {};
-    glGetIntegervRobustANGLE(name, sizeof(GLint) * 4, &bytesWritten, params);
+    GetIntegervCompat(name, sizeof(GLint) * 4, &bytesWritten, params);
 
     Napi::Array arr = Napi::Array::New(env, 4);
     arr.Set((uint32_t)0, Napi::Number::New(env, params[0]));
@@ -2231,7 +2649,7 @@ GL_METHOD(GetParameter) {
   case GL_ALIASED_POINT_SIZE_RANGE:
   case GL_DEPTH_RANGE: {
     GLfloat params[2] = {};
-    glGetFloatvRobustANGLE(name, sizeof(GLfloat) * 2, &bytesWritten, params);
+    GetFloatvCompat(name, sizeof(GLfloat) * 2, &bytesWritten, params);
 
     Napi::Array arr = Napi::Array::New(env, 2);
     arr.Set((uint32_t)0, Napi::Number::New(env, params[0]));
@@ -2242,7 +2660,7 @@ GL_METHOD(GetParameter) {
   case GL_BLEND_COLOR:
   case GL_COLOR_CLEAR_VALUE: {
     GLfloat params[4] = {};
-    glGetFloatvRobustANGLE(name, sizeof(GLfloat) * 4, &bytesWritten, params);
+    GetFloatvCompat(name, sizeof(GLfloat) * 4, &bytesWritten, params);
 
     Napi::Array arr = Napi::Array::New(env, 4);
     arr.Set((uint32_t)0, Napi::Number::New(env, params[0]));
@@ -2254,7 +2672,7 @@ GL_METHOD(GetParameter) {
 
   case GL_COLOR_WRITEMASK: {
     GLboolean params[4] = {};
-    glGetBooleanvRobustANGLE(name, sizeof(GLboolean) * 4, &bytesWritten, params);
+    GetBooleanvCompat(name, sizeof(GLboolean) * 4, &bytesWritten, params);
 
     Napi::Array arr = Napi::Array::New(env, 4);
     arr.Set((uint32_t)0, Napi::Boolean::New(env, params[0] == GL_TRUE));
@@ -2266,7 +2684,7 @@ GL_METHOD(GetParameter) {
 
   default: {
     GLint params = 0;
-    glGetIntegervRobustANGLE(name, sizeof(GLint), &bytesWritten, &params);
+    GetIntegervCompat(name, sizeof(GLint), &bytesWritten, &params);
     return ReturnParamValueOrNull(Napi::Number::New(env, params), bytesWritten, env);
   }
   }
@@ -2463,7 +2881,11 @@ GL_METHOD(DrawBuffersWEBGL) {
     buffers[i] = buffersArray.Get(i).As<Napi::Number>().Uint32Value();
   }
 
-  glDrawBuffersEXT(numBuffers, buffers);
+  if (!WebGLRenderingContext::USE_DEVICE_PATH && glDrawBuffersEXT) {
+    glDrawBuffersEXT(numBuffers, buffers);
+  } else {
+    glDrawBuffers(numBuffers, buffers);
+  }
 
   delete[] buffers;
   return env.Undefined();
@@ -2517,7 +2939,16 @@ GL_METHOD(BindVertexArrayOES) {
 
   GLuint array = info[0].As<Napi::Number>().Uint32Value();
 
-  glBindVertexArrayOES(array);
+  // *OES VAO functions are GL_OES_vertex_array_object. The standard
+  // glBindVertexArray etc. are core GLES3. NVIDIA's GLES driver may not
+  // expose the OES suffix variants (returns null/stub via eglGetProcAddress)
+  // — Three.js calls these on every render so this is the hottest crash
+  // site on the device path.
+  if (!WebGLRenderingContext::USE_DEVICE_PATH && glBindVertexArrayOES) {
+    glBindVertexArrayOES(array);
+  } else {
+    glBindVertexArray(array);
+  }
   return env.Undefined();
 }
 
@@ -2525,7 +2956,11 @@ GL_METHOD(CreateVertexArrayOES) {
   GL_BOILERPLATE;
 
   GLuint array = 0;
-  glGenVertexArraysOES(1, &array);
+  if (!WebGLRenderingContext::USE_DEVICE_PATH && glGenVertexArraysOES) {
+    glGenVertexArraysOES(1, &array);
+  } else {
+    glGenVertexArrays(1, &array);
+  }
   inst->registerGLObj(GLOBJECT_TYPE_VERTEX_ARRAY, array);
 
   return Napi::Number::New(env, array);
@@ -2537,14 +2972,25 @@ GL_METHOD(DeleteVertexArrayOES) {
   GLuint array = info[0].As<Napi::Number>().Uint32Value();
   inst->unregisterGLObj(GLOBJECT_TYPE_VERTEX_ARRAY, array);
 
-  glDeleteVertexArraysOES(1, &array);
+  if (!WebGLRenderingContext::USE_DEVICE_PATH && glDeleteVertexArraysOES) {
+    glDeleteVertexArraysOES(1, &array);
+  } else {
+    glDeleteVertexArrays(1, &array);
+  }
   return env.Undefined();
 }
 
 GL_METHOD(IsVertexArrayOES) {
   GL_BOILERPLATE;
 
-  return Napi::Boolean::New(env, glIsVertexArrayOES(info[0].As<Napi::Number>().Uint32Value()) != 0);
+  GLuint array = info[0].As<Napi::Number>().Uint32Value();
+  GLboolean isVA;
+  if (!WebGLRenderingContext::USE_DEVICE_PATH && glIsVertexArrayOES) {
+    isVA = glIsVertexArrayOES(array);
+  } else {
+    isVA = glIsVertexArray(array);
+  }
+  return Napi::Boolean::New(env, isVA != 0);
 }
 
 GL_METHOD(CopyBufferSubData) {

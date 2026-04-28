@@ -2,6 +2,7 @@
 #define WEBGL_H_
 
 #include <algorithm>
+#include <chrono>
 #include <map>
 #include <set>
 #include <utility>
@@ -44,6 +45,13 @@ struct WebGLRenderingContext : public Napi::ObjectWrap<WebGLRenderingContext> {
   // The underlying OpenGL context
   static bool HAS_DISPLAY;
   static EGLDisplay DISPLAY;
+  // True when we took the EGL_PLATFORM_DEVICE_EXT path (NVIDIA on Cloud Run)
+  // — used by GL function compat helpers to skip ANGLE-only extensions
+  // that may exist as non-null but inert stubs in NVIDIA's GLES dispatch.
+  static bool USE_DEVICE_PATH;
+  // Set via HEADLESS_GL_TRACE=1: print each GL method name to stderr before
+  // executing. Used to identify which call crashes on the device path.
+  static bool TRACE_CALLS;
 
   SharedLibrary eglLibrary;
   EGLContext context;
@@ -51,6 +59,12 @@ struct WebGLRenderingContext : public Napi::ObjectWrap<WebGLRenderingContext> {
   EGLSurface surface;
   GLContextState state;
   std::string errorMessage;
+
+  // Timestamp of the last setActive() call that succeeded. On the NVIDIA EGL
+  // device path the driver silently invalidates its internal command-queue
+  // resources after ~100-200 ms of GL inactivity; setActive() uses this to
+  // detect stale contexts and force re-activation before the next GL call.
+  std::chrono::steady_clock::time_point lastGLCallTime;
 
   // Pixel storage flags
   bool unpack_flip_y;
