@@ -153,6 +153,7 @@ std::string JoinStringSet(const std::set<std::string> &inputSet,
 bool WebGLRenderingContext::HAS_DISPLAY = false;
 bool WebGLRenderingContext::USE_DEVICE_PATH = false;
 bool WebGLRenderingContext::TRACE_CALLS = false;
+bool WebGLRenderingContext::DEBUG_LOG = false;
 EGLDisplay WebGLRenderingContext::DISPLAY;
 WebGLRenderingContext *WebGLRenderingContext::ACTIVE = NULL;
 WebGLRenderingContext *WebGLRenderingContext::CONTEXT_LIST_HEAD = NULL;
@@ -271,23 +272,17 @@ void WebGLRenderingContext::_initContext(int width, int height, bool alpha, bool
                                          bool preferLowPowerToHighPerformance,
                                          bool failIfMajorPerformanceCaveat,
                                          bool createWebGL2Context) {
-  // Whether to take the device-EGL path (NVIDIA on Cloud Run / GBM) rather
-  // than the legacy default-display path (ANGLE software, Mac, Windows).
-  // Read once at the top of the function; consulted in display selection
-  // and again when picking eglCreateContext attribs (NVIDIA rejects the
-  // ANGLE-specific WEBGL_COMPATIBILITY / ROBUST_RESOURCE_INITIALIZATION
-  // attributes — we only pass them on the legacy ANGLE path).
-  const char *headlessUseDeviceEnv = std::getenv("HEADLESS_GL_USE_DEVICE");
-  const bool useDeviceEgl =
-      headlessUseDeviceEnv != nullptr && headlessUseDeviceEnv[0] == '1';
+  // Debug logging is opt-in via HEADLESS_GL_DEBUG=1.
+  const char *dbgEnv = std::getenv("HEADLESS_GL_DEBUG");
+  if (dbgEnv && dbgEnv[0] == '1') DEBUG_LOG = true;
 
-  // Enable GL call tracing if requested (identifies crash point on device path)
+  // HEADLESS_GL_TRACE=1 prints each GL method name to stderr before executing.
   const char *traceEnv = std::getenv("HEADLESS_GL_TRACE");
   if (traceEnv && traceEnv[0] == '1') TRACE_CALLS = true;
 
   if (!eglGetProcAddress) {
     if (!eglLibrary.open("libEGL")) {
-      errorMessage = "Error opening ANGLE shared library.";
+      errorMessage = "Error opening EGL shared library.";
       state = GLCONTEXT_STATE_ERROR;
       return;
     }
@@ -296,35 +291,49 @@ void WebGLRenderingContext::_initContext(int width, int height, bool alpha, bool
     ::LoadEGL(getProcAddress);
   }
 
+  // Decide whether to take the device-EGL path (EGL_EXT_platform_device,
+  // required by drivers like NVIDIA proprietary that refuse EGL_DEFAULT_DISPLAY
+  // headlessly) or the legacy default-display path (ANGLE on Linux/Mac/Windows).
+  //
+  // Probe via the EGL client extension string: ANGLE advertises EGL_ANGLE_*
+  // extensions, and crucially relies on EGL_CONTEXT_WEBGL_COMPATIBILITY_ANGLE
+  // for WebGL conformance — so on ANGLE we must keep the legacy path. Any other
+  // loaded libEGL (NVIDIA, Mesa, etc.) takes the device path when the device
+  // query extension is exported.
+  //
+  // Overrides for diagnostics:
+  //   HEADLESS_GL_USE_DEVICE=1 — force device path on
+  //   HEADLESS_GL_NO_DEVICE=1  — force device path off
+  bool useDeviceEgl;
+  {
+    const char *forceOn = std::getenv("HEADLESS_GL_USE_DEVICE");
+    const char *forceOff = std::getenv("HEADLESS_GL_NO_DEVICE");
+    if (forceOff && forceOff[0] == '1') {
+      useDeviceEgl = false;
+    } else if (forceOn && forceOn[0] == '1') {
+      useDeviceEgl = true;
+    } else {
+      const char *clientExts = eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
+      const bool isANGLE = clientExts && strstr(clientExts, "EGL_ANGLE_") != nullptr;
+      const bool hasDeviceQuery =
+          clientExts && strstr(clientExts, "EGL_EXT_device_query") != nullptr;
+      useDeviceEgl = !isANGLE && hasDeviceQuery;
+    }
+  }
+
   // Get display
   if (!HAS_DISPLAY) {
     DISPLAY = EGL_NO_DISPLAY;
 
-    // Optional GPU device path. When HEADLESS_GL_USE_DEVICE=1 is set, use
-    // EGL_EXT_platform_device + eglQueryDevicesEXT to bind directly to a
-    // hardware GPU (e.g. NVIDIA L4 on Cloud Run) instead of the default
-    // eglGetDisplay(EGL_DEFAULT_DISPLAY) path. NVIDIA's libEGL refuses
-    // EGL_DEFAULT_DISPLAY headlessly — it requires explicit device
-    // enumeration. Without this branch the only working path is ANGLE's
-    // bundled software EGL, which means CPU rendering even when a GPU is
-    // attached to the container.
     if (useDeviceEgl) {
       // eglQueryDevicesEXT is not in the autoloaded EGL surface — load it
-      // dynamically. eglGetPlatformDisplayEXT IS already loaded by LoadEGL().
+      // dynamically. eglGetPlatformDisplayEXT is already loaded by LoadEGL().
       typedef EGLBoolean (EGLAPIENTRYP PFNQUERYDEVICES)(
           EGLint max_devices, EGLDeviceEXT *devices, EGLint *num_devices);
       auto queryDevices = reinterpret_cast<PFNQUERYDEVICES>(
           eglGetProcAddress("eglQueryDevicesEXT"));
 
-      if (!queryDevices) {
-        std::cerr << "[headless-gl] HEADLESS_GL_USE_DEVICE=1 but "
-                     "eglQueryDevicesEXT not exported by the loaded libEGL"
-                  << std::endl;
-      } else if (!eglGetPlatformDisplayEXT) {
-        std::cerr << "[headless-gl] HEADLESS_GL_USE_DEVICE=1 but "
-                     "eglGetPlatformDisplayEXT not exported by the loaded libEGL"
-                  << std::endl;
-      } else {
+      if (queryDevices && eglGetPlatformDisplayEXT) {
         EGLDeviceEXT devices[8];
         EGLint numDevices = 0;
         if (queryDevices(8, devices, &numDevices) && numDevices > 0) {
@@ -332,24 +341,17 @@ void WebGLRenderingContext::_initContext(int width, int height, bool alpha, bool
                                              devices[0], nullptr);
           if (DISPLAY != EGL_NO_DISPLAY) {
             USE_DEVICE_PATH = true;
-            std::cerr << "[headless-gl] using EGL_PLATFORM_DEVICE_EXT ("
-                      << numDevices << " device(s) enumerated, picked #0)"
-                      << std::endl;
-          } else {
-            std::cerr << "[headless-gl] eglGetPlatformDisplayEXT returned "
-                         "EGL_NO_DISPLAY for device #0"
-                      << std::endl;
+            if (DEBUG_LOG) {
+              std::cerr << "[headless-gl] using EGL_PLATFORM_DEVICE_EXT ("
+                        << numDevices << " device(s), picked #0)\n";
+            }
           }
-        } else {
-          std::cerr << "[headless-gl] eglQueryDevicesEXT found "
-                    << numDevices << " device(s) — falling back" << std::endl;
         }
       }
     }
 
-    // Fallback: legacy default-display path. This is the only path on
-    // ANGLE's bundled software EGL and on systems without the device
-    // extension; it is also the cheap path on Mac (Metal) and Windows.
+    // Fallback: legacy default-display path. Used by ANGLE on every platform
+    // and by any driver where device enumeration didn't yield a usable display.
     if (DISPLAY == EGL_NO_DISPLAY) {
       DISPLAY = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     }
@@ -366,10 +368,11 @@ void WebGLRenderingContext::_initContext(int width, int height, bool alpha, bool
       return;
     }
 
-    // Bind the OpenGL ES client API. Default-bound is EGL_OPENGL_ES_API on
-    // most drivers but NVIDIA's libEGL is stricter when its current bind
-    // state isn't ES — be explicit so eglCreateContext picks the right path.
-    if (useDeviceEgl) {
+    // Bind the OpenGL ES client API explicitly. Default-bound is
+    // EGL_OPENGL_ES_API on most drivers but NVIDIA's libEGL is stricter when
+    // its current bind state isn't ES — be explicit on the device path so
+    // eglCreateContext picks the right code path.
+    if (USE_DEVICE_PATH) {
       eglBindAPI(EGL_OPENGL_ES_API);
     }
 
@@ -377,12 +380,12 @@ void WebGLRenderingContext::_initContext(int width, int height, bool alpha, bool
     HAS_DISPLAY = true;
   }
 
-  // Set up configuration. Note: the ANGLE path uses what looks like an
-  // inverted ES2/ES3 bit — keep that as-is for backwards compat, but on the
-  // device-EGL path use the correct mapping (WebGL2 → GLES3) so NVIDIA
-  // returns a matching config.
+  // Set up configuration. The legacy ANGLE path uses what looks like an
+  // inverted ES2/ES3 bit — keep that as-is for backwards compat. On the
+  // device-EGL path use the spec-correct mapping (WebGL2 → GLES3) so the
+  // driver returns a matching config.
   EGLint renderableTypeBit;
-  if (useDeviceEgl) {
+  if (USE_DEVICE_PATH) {
     renderableTypeBit = createWebGL2Context ? EGL_OPENGL_ES3_BIT : EGL_OPENGL_ES2_BIT;
   } else {
     renderableTypeBit = createWebGL2Context ? EGL_OPENGL_ES2_BIT : EGL_OPENGL_ES3_BIT;
@@ -430,7 +433,7 @@ void WebGLRenderingContext::_initContext(int width, int height, bool alpha, bool
                                 createWebGL2Context ? 3 : 2,
                                 EGL_NONE};
   context = eglCreateContext(DISPLAY, config, EGL_NO_CONTEXT,
-                             useDeviceEgl ? contextAttribsStd : contextAttribsAngle);
+                             USE_DEVICE_PATH ? contextAttribsStd : contextAttribsAngle);
   if (context == EGL_NO_CONTEXT) {
     state = GLCONTEXT_STATE_ERROR;
     return;
@@ -470,16 +473,13 @@ void WebGLRenderingContext::_initContext(int width, int height, bool alpha, bool
   // already guard via !USE_DEVICE_PATH, but remapping ensures that any call site
   // we might have missed also uses a real function instead of a null/inert stub.
   if (USE_DEVICE_PATH) {
-    const char *dbg = std::getenv("HEADLESS_GL_DEBUG");
-    const bool debugMode = dbg && dbg[0] == '1';
-
     // ── dlsym fallback for GLES3 core functions ─────────────────────────────
     // Load from the currently-mapped libGLESv2 (NVIDIA's, after the CMD
     // symlink step). RTLD_DEFAULT searches all loaded shared libraries.
 #define FILL_GLES3(ptr, name)                                                   \
     if (!l_gl##ptr) {                                                            \
       l_gl##ptr = reinterpret_cast<decltype(l_gl##ptr)>(dlsym(RTLD_DEFAULT, "gl" #name)); \
-      if (debugMode) {                                                            \
+      if (WebGLRenderingContext::DEBUG_LOG) {                                    \
         if (l_gl##ptr)                                                           \
           std::cerr << "[headless-gl] dlsym recovered: gl" #name "\n";          \
         else                                                                     \
@@ -638,7 +638,7 @@ void WebGLRenderingContext::_initContext(int width, int height, bool alpha, bool
 
 #undef REMAP_TO_GLES3
 
-    if (debugMode) {
+    if (DEBUG_LOG) {
       std::cerr << "[headless-gl] Phase-3 fixup complete (device path)\n";
     }
   } // end USE_DEVICE_PATH fixup
@@ -734,8 +734,10 @@ bool WebGLRenderingContext::setActive() {
         now - lastGLCallTime).count();
     if (ms > 80) {
       idle = true;
-      std::cerr << "[headless-gl] setActive: " << ms
-                << "ms idle on NVIDIA device path — forcing re-activation\n";
+      if (DEBUG_LOG) {
+        std::cerr << "[headless-gl] setActive: " << ms
+                  << "ms idle on NVIDIA device path — forcing re-activation\n";
+      }
     }
   }
 

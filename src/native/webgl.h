@@ -52,6 +52,9 @@ struct WebGLRenderingContext : public Napi::ObjectWrap<WebGLRenderingContext> {
   // Set via HEADLESS_GL_TRACE=1: print each GL method name to stderr before
   // executing. Used to identify which call crashes on the device path.
   static bool TRACE_CALLS;
+  // Set via HEADLESS_GL_DEBUG=1: print device-path init details and the
+  // setActive() idle-recovery notice. No effect on normal operation.
+  static bool DEBUG_LOG;
 
   SharedLibrary eglLibrary;
   EGLContext context;
