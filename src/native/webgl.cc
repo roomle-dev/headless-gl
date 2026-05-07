@@ -1,5 +1,4 @@
 #include <array>
-#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
@@ -234,8 +233,7 @@ WebGLRenderingContext::WebGLRenderingContext(const Napi::CallbackInfo& info)
     : Napi::ObjectWrap<WebGLRenderingContext>(info),
       state(GLCONTEXT_STATE_INIT), unpack_flip_y(false), unpack_premultiply_alpha(false),
       unpack_colorspace_conversion(0x9244), unpack_alignment(4),
-      webGLToANGLEExtensions(&CaseInsensitiveCompare), next(NULL), prev(NULL),
-      lastGLCallTime(std::chrono::steady_clock::now()) {
+      webGLToANGLEExtensions(&CaseInsensitiveCompare), next(NULL), prev(NULL) {
   Napi::Env env = info.Env();
   if (info.Length() < 11) {
     // Called with no args (e.g. from wrapContext) — create an empty shell, no GL context.
@@ -713,38 +711,11 @@ bool WebGLRenderingContext::setActive() {
     return false;
   }
 
-  auto now = std::chrono::steady_clock::now();
-
-  // Fast path: context already current and we've seen a GL call recently.
-  //
-  // On NVIDIA's EGL device path (USE_DEVICE_PATH=true) the driver silently
-  // invalidates its internal command-queue / ring-buffer resources after
-  // roughly 100-200 ms of GL inactivity. eglGetCurrentContext() still returns
-  // our context handle (the EGL object is intact), but the very next
-  // GPU-write call (glGenTextures, glBindTexture, …) crashes deep inside the
-  // NVIDIA driver at an arbitrary library address.
-  //
-  // Workaround: whenever it has been >80 ms since the last setActive() on the
-  // device path, force a fresh eglMakeCurrent even if the context appears
-  // current. After re-binding we also call glGetError() — a cheap no-op that
-  // forces the driver to re-initialize its command-queue before the real call.
-  bool idle = false;
-  if (USE_DEVICE_PATH) {
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now - lastGLCallTime).count();
-    if (ms > 80) {
-      idle = true;
-      if (DEBUG_LOG) {
-        std::cerr << "[headless-gl] setActive: " << ms
-                  << "ms idle on NVIDIA device path — forcing re-activation\n";
-      }
-    }
-  }
-
-  bool needsMakeCurrent = !(this == ACTIVE && eglGetCurrentContext() == context);
-
-  if (!needsMakeCurrent && !idle) {
-    lastGLCallTime = now;
+  // Fast path: this context is already current on the calling thread.
+  // eglGetCurrentContext() is per-thread, so it returns EGL_NO_CONTEXT on a
+  // fresh thread or after another context destruction has un-made-current,
+  // forcing the eglMakeCurrent path below in those cases.
+  if (this == ACTIVE && eglGetCurrentContext() == context) {
     return true;
   }
 
@@ -754,7 +725,6 @@ bool WebGLRenderingContext::setActive() {
   }
 
   ACTIVE = this;
-  lastGLCallTime = now;
   return true;
 }
 

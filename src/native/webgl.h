@@ -2,7 +2,6 @@
 #define WEBGL_H_
 
 #include <algorithm>
-#include <chrono>
 #include <map>
 #include <set>
 #include <utility>
@@ -62,12 +61,6 @@ struct WebGLRenderingContext : public Napi::ObjectWrap<WebGLRenderingContext> {
   EGLSurface surface;
   GLContextState state;
   std::string errorMessage;
-
-  // Timestamp of the last setActive() call that succeeded. On the NVIDIA EGL
-  // device path the driver silently invalidates its internal command-queue
-  // resources after ~100-200 ms of GL inactivity; setActive() uses this to
-  // detect stale contexts and force re-activation before the next GL call.
-  std::chrono::steady_clock::time_point lastGLCallTime;
 
   // Pixel storage flags
   bool unpack_flip_y;
