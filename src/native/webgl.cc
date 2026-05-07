@@ -2909,7 +2909,9 @@ GL_METHOD(EXTWEBGL_draw_buffers) {
 GL_METHOD(BindVertexArrayOES) {
   GL_BOILERPLATE;
 
-  GLuint array = info[0].As<Napi::Number>().Uint32Value();
+  GLuint array = (info[0].IsNull() || info[0].IsUndefined())
+    ? 0
+    : info[0].As<Napi::Number>().Uint32Value();
 
   // *OES VAO functions are GL_OES_vertex_array_object. The standard
   // glBindVertexArray etc. are core GLES3. NVIDIA's GLES driver may not
@@ -3900,7 +3902,9 @@ GL_METHOD(IsVertexArray) {
 
 GL_METHOD(BindVertexArray) {
   GL_BOILERPLATE;
-  GLuint vao = info[0].As<Napi::Number>().Uint32Value();
+  GLuint vao = (info[0].IsNull() || info[0].IsUndefined())
+    ? 0
+    : info[0].As<Napi::Number>().Uint32Value();
   glBindVertexArray(vao);
   return env.Undefined();
 }
