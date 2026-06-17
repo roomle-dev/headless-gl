@@ -1709,12 +1709,20 @@ GL_METHOD(TexSubImage2D) {
   GLsizei height = info[5].As<Napi::Number>().Int32Value();
   GLenum format = info[6].As<Napi::Number>().Int32Value();
   GLenum type = info[7].As<Napi::Number>().Int32Value();
-  auto _arr_pixels2 = info[8].As<Napi::TypedArray>();
-  unsigned char* pixels = reinterpret_cast<unsigned char*>(
-      static_cast<uint8_t*>(_arr_pixels2.ArrayBuffer().Data()) + _arr_pixels2.ByteOffset());
-  size_t pixels_len = _arr_pixels2.ByteLength();
+  // Guard against a null/undefined pixels argument (e.g. when the JS
+  // convertPixels() helper can't recognise the typed-array view). Mirrors the
+  // null check in TexImage2D — without it, As<TypedArray>().ArrayBuffer().Data()
+  // dereferences null and segfaults the process (NAPI fatal under Bun).
+  unsigned char* pixels = nullptr;
+  size_t pixels_len = 0;
+  if (!info[8].IsNull() && !info[8].IsUndefined()) {
+    auto _arr_pixels2 = info[8].As<Napi::TypedArray>();
+    pixels = reinterpret_cast<unsigned char*>(
+        static_cast<uint8_t*>(_arr_pixels2.ArrayBuffer().Data()) + _arr_pixels2.ByteOffset());
+    pixels_len = _arr_pixels2.ByteLength();
+  }
 
-  if (inst->unpack_flip_y || inst->unpack_premultiply_alpha) {
+  if (pixels && (inst->unpack_flip_y || inst->unpack_premultiply_alpha)) {
     std::vector<uint8_t> unpacked = inst->unpackPixels(type, format, width, height, pixels);
     TexSubImage2DCompat(target, level, xoffset, yoffset, width, height, format, type,
                         unpacked.size(), unpacked.data());
@@ -3108,18 +3116,23 @@ GL_METHOD(TexImage3D) {
   GLint border = info[6].As<Napi::Number>().Int32Value();
   GLenum format = info[7].As<Napi::Number>().Int32Value();
   GLenum type = info[8].As<Napi::Number>().Int32Value();
-  if (info[9].IsUndefined()) {
-    glTexImage3D(target, level, internalformat, width, height, depth, border, format, type,
-                 nullptr);
-  } else if (info[9].IsTypedArray()) {
+  // null/undefined -> nullptr (allocate without initializing). three passes
+  // null when allocating a TEXTURE_2D_ARRAY/3D before filling it via
+  // texSubImage3D; the previous IsUndefined-only check rejected null and threw,
+  // leaving the texture incomplete ("zero texture"). Also accept a bare
+  // ArrayBuffer for completeness.
+  const void *bufferPtr = nullptr;
+  if (info[9].IsTypedArray()) {
     auto buffer = info[9].As<Napi::TypedArray>();
-    void *bufferPtr = (static_cast<uint8_t*>(buffer.ArrayBuffer().Data()) + buffer.ByteOffset());
-    glTexImage3D(target, level, internalformat, width, height, depth, border, format, type,
-                 bufferPtr);
-  } else {
+    bufferPtr = static_cast<uint8_t*>(buffer.ArrayBuffer().Data()) + buffer.ByteOffset();
+  } else if (info[9].IsArrayBuffer()) {
+    bufferPtr = info[9].As<Napi::ArrayBuffer>().Data();
+  } else if (!info[9].IsNull() && !info[9].IsUndefined()) {
     Napi::TypeError::New(env, "Invalid data type for TexImage3D").ThrowAsJavaScriptException();
     return env.Undefined();
   }
+  glTexImage3D(target, level, internalformat, width, height, depth, border, format, type,
+               bufferPtr);
   return env.Undefined();
 }
 
@@ -3135,18 +3148,20 @@ GL_METHOD(TexSubImage3D) {
   GLsizei depth = info[7].As<Napi::Number>().Int32Value();
   GLenum format = info[8].As<Napi::Number>().Int32Value();
   GLenum type = info[9].As<Napi::Number>().Int32Value();
-  if (info[10].IsUndefined()) {
-    glTexSubImage3D(target, level, xoffset, yoffset, zoffset, width, height, depth, format, type,
-                    nullptr);
-  } else if (info[10].IsTypedArray()) {
+  // null/undefined -> nullptr; also accept ArrayBuffer. Mirrors TexImage3D so a
+  // null data argument never throws (it just leaves the sub-region untouched).
+  const void *bufferPtr = nullptr;
+  if (info[10].IsTypedArray()) {
     auto buffer = info[10].As<Napi::TypedArray>();
-    void *bufferPtr = (static_cast<uint8_t*>(buffer.ArrayBuffer().Data()) + buffer.ByteOffset());
-    glTexSubImage3D(target, level, xoffset, yoffset, zoffset, width, height, depth, format, type,
-                    bufferPtr);
-  } else {
+    bufferPtr = static_cast<uint8_t*>(buffer.ArrayBuffer().Data()) + buffer.ByteOffset();
+  } else if (info[10].IsArrayBuffer()) {
+    bufferPtr = info[10].As<Napi::ArrayBuffer>().Data();
+  } else if (!info[10].IsNull() && !info[10].IsUndefined()) {
     Napi::TypeError::New(env, "Invalid data type for TexSubImage3D").ThrowAsJavaScriptException();
     return env.Undefined();
   }
+  glTexSubImage3D(target, level, xoffset, yoffset, zoffset, width, height, depth, format, type,
+                  bufferPtr);
   return env.Undefined();
 }
 

@@ -199,15 +199,15 @@ function convertPixels (pixels) {
   if (typeof pixels === 'object' && pixels !== null) {
     if (pixels instanceof ArrayBuffer) {
       return new Uint8Array(pixels)
-    } else if (
-      pixels instanceof Uint8Array ||
-      pixels instanceof Uint16Array ||
-      pixels instanceof Uint8ClampedArray ||
-      pixels instanceof Float32Array
-    ) {
+    } else if (ArrayBuffer.isView(pixels)) {
+      // Covers every typed-array view — Int8/Uint8/Uint8Clamped/Int16/Uint16/
+      // Int32/Uint32/Float32/Float64 — plus Node Buffer and DataView, by
+      // viewing their underlying bytes. The previous explicit instanceof list
+      // missed Int32Array/Uint32Array, which WebGL2 integer textures use (e.g.
+      // three-mesh-bvh packs its BVH into RGBA32UI/RGBA32I textures). Those fell
+      // through to `return null`, and the native texSubImage2D then dereferenced
+      // the null pixel pointer -> segfault (Node) / NAPI fatal (Bun).
       return unpackTypedArray(pixels)
-    } else if (pixels instanceof Buffer) {
-      return new Uint8Array(pixels)
     }
   }
   return null
